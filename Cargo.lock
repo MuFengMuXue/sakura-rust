@@ -2091,6 +2091,7 @@ name = "sakura-rust"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "dotenvy",
  "langgraph",
  "reqwest 0.13.4",
