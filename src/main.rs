@@ -38,7 +38,7 @@ struct SearchRequest {
 
 //搜索记忆的返回结构体
 #[derive(Deserialize)]
-struct Memory {
+struct SearchMessage {
     id: Option<String>,
     content: String,
     created_at: Option<String>,
@@ -46,7 +46,7 @@ struct Memory {
 }
 #[derive(Deserialize)]
 struct SearchResponse {
-    memories: Vec<Memory>,
+    memories: Vec<SearchMessage>,
 }
 
 // 反馈请求结构（发送给 /memory/feedback）
@@ -72,8 +72,13 @@ struct FeedbackResponse {
 
 //添加记忆请求结构(发送给/add)
 #[derive(Serialize)]
-struct AddRequest{
+struct AddMessage {
+    role: String,
     content: String,
+}
+#[derive(Serialize)]
+struct AddRequest{
+    messages: Vec<AddMessage>,
     user_id: String,
 }
 
@@ -267,13 +272,16 @@ async fn add_memory(content: String) -> Result<String, String> {
         .map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
     let user_id = env::var("USER_ID")
         .unwrap_or_else(|_| "default".to_string());
-    let url = format!("{}/memory/feedback", base_url);
+    let url = format!("{}/add", base_url);
 
     //构造请求
     let client = reqwest::Client::new();
     let payload = AddRequest{
-        content: content.clone(),
-        user_id: user_id
+        messages: vec![AddMessage{
+            role: "user".to_string(),
+            content:content.clone()
+        }],
+        user_id
     };
 
     //发送请求
