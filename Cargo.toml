@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-langgraph = { version = "0.2.5", features = ["full"] }
+langgraph = { path = "F:/langgraph-rust",features = ["full"] }
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -13,6 +13,8 @@ dotenvy = "0.15"
 async-trait = "0.1"
 reqwest = { version = "0.13", features = ["json"] }
 chrono = "0.4"
+env_logger = "0.11.11"
+
 
 [profile.release]
 opt-level = 3
