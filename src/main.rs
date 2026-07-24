@@ -1,38 +1,39 @@
-use std::env;
-use std::time::Instant;
-use std::sync::Arc;
-use std::io::{self, Write};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::env;
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::time::Instant;
 
-
-use serde_json::Value as JsonValue;
-use langgraph::checkpoint::InMemorySaver;
 use dotenvy::dotenv;
-use langgraph::prelude::*;
-use langgraph::tool;
+use langgraph::checkpoint::InMemorySaver;
 use langgraph::langgraph_state;
-use langgraph::prebuilt::{BaseChatModel, Message, ToolNode, prepare_tools, stream_llm,tools_condition,print_stream};
-use langgraph::providers::openai::{OpenAIModelConfig,OpenAIModel};
+use langgraph::prebuilt::{
+    BaseChatModel, Message, ToolNode, prepare_tools, print_stream, stream_llm, tools_condition,
+};
+use langgraph::prelude::*;
+use langgraph::providers::openai::{OpenAIModel, OpenAIModelConfig};
+use langgraph::tool;
+use serde_json::Value as JsonValue;
 use tokio_stream::StreamExt;
-
 
 //定义state
 #[langgraph_state]
 #[derive(Debug)]
-struct GraphState{
+struct GraphState {
     #[channel(messages)]
     messages: Vec<Message>,
     #[channel]
     search_context: String,
 }
 
+///搜索记忆
 //定义搜索记忆的请求结构体（发送给/search）
 #[derive(Serialize)]
 struct SearchRequest {
     user_id: String,
     query: String,
-    top_k: u8,              // 或 i32
+    top_k: u8,                 // 或 i32
     similarity_threshold: f32, // 或 f32
 }
 
@@ -49,17 +50,17 @@ struct SearchResponse {
     memories: Vec<SearchMessage>,
 }
 
+///反馈记忆
 // 反馈请求结构（发送给 /memory/feedback）
 #[derive(Serialize)]
 struct FeedbackRequest {
     memory_id: String,
-    feedback_type: String,   // correct, supplement, delete
+    feedback_type: String, // correct, supplement, delete
     reason: String,
     user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     correction: Option<String>,
 }
-
 // 反馈响应结构（从服务端解析）
 #[derive(Deserialize)]
 struct FeedbackResponse {
@@ -70,6 +71,7 @@ struct FeedbackResponse {
     message: Option<String>,
 }
 
+///添加记忆
 //添加记忆请求结构(发送给/add)
 #[derive(Serialize)]
 struct AddMessage {
@@ -77,11 +79,10 @@ struct AddMessage {
     content: String,
 }
 #[derive(Serialize)]
-struct AddRequest{
+struct AddRequest {
     messages: Vec<AddMessage>,
     user_id: String,
 }
-
 
 //辅助处理时间的函数
 fn parse_time_to_chinese_date(iso_str: &str) -> String {
@@ -92,9 +93,8 @@ fn parse_time_to_chinese_date(iso_str: &str) -> String {
         return utc.format("%Y年%m月%d日").to_string();
     }
     // 如果解析失败，截取前 10 个字符（如 "2026-07-11"）
-    iso_str.chars().take(10).collect()
+    return iso_str.chars().take(10).collect();
 }
-
 
 //定义工具函数
 #[tool("search_memory"," 从记忆中深度搜索相关的历史信息和对话。当系统未给出合适的信息时使用。
@@ -102,10 +102,8 @@ fn parse_time_to_chinese_date(iso_str: &str) -> String {
     也可用于主动搜索用户的偏好、经历、约定等
     参数：query: 需要查询的内容")]
 async fn search_memory(query: String) -> Result<String, String> {
-    let base_url = env::var("MEMOS_BASE_URL")
-        .map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
-    let user_id = env::var("USER_ID")
-        .unwrap_or_else(|_| "default".to_string());
+    let base_url = env::var("MEMOS_BASE_URL").map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
+    let user_id = env::var("USER_ID").unwrap_or_else(|_| "default".to_string());
     let url = format!("{}/search", base_url);
 
     let client = reqwest::Client::new();
@@ -116,7 +114,6 @@ async fn search_memory(query: String) -> Result<String, String> {
         similarity_threshold: 0.5,
     };
 
-   
     let response = client
         .post(&url)
         .json(&payload)
@@ -138,7 +135,7 @@ async fn search_memory(query: String) -> Result<String, String> {
         .map_err(|e| format!("解析失败: {}", e))?;
 
     if data.memories.is_empty() {
-        return Ok(format!("没有与'{}'相关的记忆", query));
+        return Ok(format!("没有与{}相关的记忆", query));
     }
 
     let mut lines = Vec::new();
@@ -170,45 +167,52 @@ async fn search_memory(query: String) -> Result<String, String> {
     Ok(format!("相关记忆:\n{}", lines.join("\n")))
 }
 
-#[tool("correct_memory","修正、补充或删除已有的记忆。
+#[tool(
+    "correct_memory",
+    "修正、补充或删除已有的记忆。
     需要先用 memos_search_memory 获取记忆 ID。
     参数：memory_id: 要操作的记忆 ID（通过搜索获取）
          action: 操作类型，可选值：'correct'（修正）、'supplement'（补充）、'delete'（删除）
          new_content: 修正或补充的新内容（当 action 为 correct 或 supplement 时必填）
-         reason: 操作原因")]
-async fn correct_memory(memory_id: String,action: String,new_content: Option<String>,reason:Option<String>) -> Result<String,String> {
+         reason: 操作原因"
+)]
+async fn correct_memory(
+    memory_id: String,
+    action: String,
+    new_content: Option<String>,
+    reason: Option<String>,
+) -> Result<String, String> {
     //参数检验
-    if memory_id.is_empty(){
+    if memory_id.is_empty() {
         return Err("错误，未提供记忆id。请先通过search_memory获取id".to_string());
     }
     let action_str = action.trim().to_lowercase();
-    if !["correct","supplement","delete"].contains(&action_str.as_str()){
+    if !["correct", "supplement", "delete"].contains(&action_str.as_str()) {
         return Err("错误：未指定操作类型。可选：correct、supplement、delete".to_string());
     }
-    if (action_str == "correct" || action_str == "supplement") && new_content.as_ref().map_or(true, |s| s.is_empty()){
+    if (action_str == "correct" || action_str == "supplement")
+        && new_content.as_ref().map_or(true, |s| s.is_empty())
+    {
         return Err(format!("错误：{} 必须提供 new_content", action_str));
     }
 
     //读取环境变量
-    let base_url = env::var("MEMOS_BASE_URL")
-        .map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
-    let user_id = env::var("USER_ID")
-        .unwrap_or_else(|_| "default".to_string());
+    let base_url = env::var("MEMOS_BASE_URL").map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
+    let user_id = env::var("USER_ID").unwrap_or_else(|_| "default".to_string());
     let url = format!("{}/memory/feedback", base_url);
 
     //构造请求
     let client = reqwest::Client::new();
-    let payload =FeedbackRequest {
+    let payload = FeedbackRequest {
         memory_id: memory_id,
         user_id: user_id,
         reason: reason.unwrap_or_default(),
         feedback_type: action_str.clone(),
         correction: if action_str == "correct" || action_str == "supplement" {
             new_content
-        }
-        else{
+        } else {
             None
-        }
+        },
     };
 
     //发送请求
@@ -219,7 +223,7 @@ async fn correct_memory(memory_id: String,action: String,new_content: Option<Str
         .send()
         .await
         .map_err(|e| format!("请求失败: {}", e))?;
-    
+
     //处理响应状态码
     let status = response.status();
     if status == 200 {
@@ -231,61 +235,62 @@ async fn correct_memory(memory_id: String,action: String,new_content: Option<Str
         if data.status == "success" {
             if action_str == "delete" {
                 return Ok(format!("记忆成功删除，ID: {}", payload.memory_id));
-            } 
-            else {                    
-                let action_name = if action_str == "correct" { "修正" } else { "补充" };
+            } else {
+                let action_name = if action_str == "correct" {
+                    "修正"
+                } else {
+                    "补充"
+                };
                 let new_content_display = data.new_content.unwrap_or_else(|| {
                     // 如果服务端没返回新内容，使用请求中的
-                payload.correction.unwrap_or_default()
-            });
-            return Ok(format!(
-                "已成功{}\nID: {}\n新内容: {}",
-                action_name, payload.memory_id, new_content_display
-            ));
+                    payload.correction.unwrap_or_default()
+                });
+                return Ok(format!(
+                    "已成功{}\nID: {}\n新内容: {}",
+                    action_name, payload.memory_id, new_content_display
+                ));
             }
-        } 
-        else {
+        } else {
             let msg = data.message.unwrap_or_else(|| "未知错误".to_string());
             return Err(format!("操作失败：{}", msg));
         }
-    }
-
-    else if response.status() == 404 {
-        return Err(format!("记忆ID {} 不存在，请确认ID是否正确", payload.memory_id));
-    } 
-    else {
+    } else if response.status() == 404 {
+        return Err(format!(
+            "记忆ID {} 不存在，请确认ID是否正确",
+            payload.memory_id
+        ));
+    } else {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("操作失败 (HTTP {}): {}", status, error_text));
     }
-
-
 }
 
-#[tool("add_memory"," 记住重要信息。
+#[tool(
+    "add_memory",
+    " 记住重要信息。
     当用户明确说“记住”、“别忘了”，或者透露个人偏好时使用。
     或者是你觉得重要的内容，也可以调用。
     参数：
-        content: 要记住的内容（简洁明了）")]
+        content: 要记住的内容（简洁明了）"
+)]
 async fn add_memory(content: String) -> Result<String, String> {
     //读取环境变量
-    let base_url = env::var("MEMOS_BASE_URL")
-        .map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
-    let user_id = env::var("USER_ID")
-        .unwrap_or_else(|_| "default".to_string());
+    let base_url = env::var("MEMOS_BASE_URL").map_err(|_| "MEMOS_BASE_URL not set".to_string())?;
+    let user_id = env::var("USER_ID").unwrap_or_else(|_| "default".to_string());
     let url = format!("{}/add", base_url);
 
     //构造请求
     let client = reqwest::Client::new();
-    let payload = AddRequest{
-        messages: vec![AddMessage{
+    let payload = AddRequest {
+        messages: vec![AddMessage {
             role: "user".to_string(),
-            content:content.clone()
+            content: content.clone(),
         }],
-        user_id
+        user_id,
     };
 
     //发送请求
-    let response =  client
+    let response = client
         .post(&url)
         .json(&payload)
         .timeout(std::time::Duration::from_secs(3))
@@ -294,15 +299,16 @@ async fn add_memory(content: String) -> Result<String, String> {
         .map_err(|e| format!("请求失败: {}", e))?;
 
     let status = response.status();
-    if status==200 {
-        return Ok(format!("已成功记住{}",content));
-    }
-    else{
+    if status == 200 {
+        return Ok(format!("已成功记住{}", content));
+    } else {
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("出现错误，状态码：{}，具体信息：{}",status,error_text));
+        return Err(format!(
+            "出现错误，状态码：{}，具体信息：{}",
+            status, error_text
+        ));
     }
 }
-
 
 //从环境变量中加载配置
 fn load_openai_config() -> (String, Option<String>, String) {
@@ -324,7 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: model_name,
         api_key,
         api_base,
-        extra_body:Some(serde_json::json!({
+        extra_body: Some(serde_json::json!({
             "thinking": {"type": "disabled"},
         })),
         ..Default::default()
@@ -341,93 +347,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channels = GraphState::create_channels();
     let mut graph = StateGraph::new(channels);
 
-    graph.add_node("search_memories", move |input: JsonValue, _config: RunnableConfig| {
-    async move {
-        // 提取用户消息
-        let last_user_msg = input
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.last())
-            .and_then(|msg| msg.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+    graph.add_node(
+        "search_memories",
+        move |input: JsonValue, _config: RunnableConfig| {
+            async move {
+                // 提取用户消息
+                let last_user_msg = input
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.last())
+                    .and_then(|msg| msg.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
 
-        if last_user_msg.is_empty() {
-            return Ok(serde_json::json!({"search_context": ""}));
-        }
+                if last_user_msg.is_empty() {
+                    return Ok(serde_json::json!({"search_context": ""}));
+                }
 
-        // 读取环境变量
-        let base_url = match env::var("MEMOS_BASE_URL") {
-            Ok(v) => v,
-            Err(_) => return Err(RunnableError::Other("MEMOS_BASE_URL not set".into())),
-        };
-        let user_id = env::var("USER_ID")
-           .unwrap_or_else(|_| "01".to_string());
+                // 读取环境变量
+                let base_url = match env::var("MEMOS_BASE_URL") {
+                    Ok(v) => v,
+                    Err(_) => return Err(RunnableError::Other("MEMOS_BASE_URL not set".into())),
+                };
+                let user_id = env::var("USER_ID").unwrap_or_else(|_| "01".to_string());
 
-        //构造请求
-        let client = reqwest::Client::new();
-        let payload = SearchRequest{
-            query: last_user_msg.to_string(),
-            user_id: user_id,
-            top_k: 5,
-            similarity_threshold:0.4
-        };
+                //构造请求
+                let client = reqwest::Client::new();
+                let payload = SearchRequest {
+                    query: last_user_msg.to_string(),
+                    user_id: user_id,
+                    top_k: 5,
+                    similarity_threshold: 0.4,
+                };
 
-        let url = format!("{}/search", base_url);
+                let url = format!("{}/search", base_url);
 
-        // 4. 发送请求（显式 match 处理错误）
-        let response = match client
-            .post(&url)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(RunnableError::Other(Box::new(e))),
-        };
+                //发送请求（显式 match 处理错误）
+                let response = match client
+                    .post(&url)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => return Err(RunnableError::Other(Box::new(e))),
+                };
 
-        //检查状态码并解析
-        let context = if response.status().is_success() {
-            // 使用 SearchResponse 结构体解析
-            let data: SearchResponse = match response.json().await {
-                Ok(d) => d,
-                Err(e) => return Err(RunnableError::Other(Box::new(e))),
-            };
-            // 只提取 content，换行拼接
-            data.memories
-                .into_iter()
-                .map(|m| m.content)
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            eprintln!("搜索失败，状态码: {}", response.status());
-            String::new()
-        };
+                //检查状态码并解析
+                let context = if response.status().is_success() {
+                    // 使用 SearchResponse 结构体解析
+                    let data: SearchResponse = match response.json().await {
+                        Ok(d) => d,
+                        Err(e) => return Err(RunnableError::Other(Box::new(e))),
+                    };
+                    // 只提取 content，换行拼接
+                    data.memories
+                        .into_iter()
+                        .map(|m| m.content)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    eprintln!("搜索失败，状态码: {}", response.status());
+                    String::new()
+                };
 
-        // 6. 返回状态更新
-        return Ok(serde_json::json!({"search_context": context}));
-    }
-    })?;
+                //返回状态更新
+                return Ok(serde_json::json!({"search_context": context}));
+            }
+        },
+    )?;
 
     let model_clone = model_with_tools.clone();
-    graph.add_node("llm_call", move |input: JsonValue, _config: RunnableConfig| {
-    let model = model_clone.clone();
-    async move {
-        let context = input.get("search_context").and_then(|c| c.as_str()).unwrap_or("");
-        let mut sys_prompt = "你是一个助手".to_string();
-        if !context.is_empty() {
-            sys_prompt.push_str(&format!("\n以下是可能相关的记忆：\n{}", context));
-        }
-        let result = stream_llm(
-            model.as_ref(),
-            &input,
-            &sys_prompt,
-        ).await?;
-        // 假设 stream_llm 返回的是包含 messages 的 JsonValue
-        return Ok(result);
-    }
-    })?;
+    graph.add_node(
+        "llm_call",
+        move |input: JsonValue, _config: RunnableConfig| {
+            let model = model_clone.clone();
+            async move {
+                let context = input
+                    .get("search_context")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let mut sys_prompt = "你是一个助手".to_string();
+                if !context.is_empty() {
+                    sys_prompt.push_str(&format!("\n以下是可能相关的记忆：\n{}", context));
+                }
+                let result = stream_llm(model.as_ref(), &input, &sys_prompt).await?;
+                // 假设 stream_llm 返回的是包含 messages 的 JsonValue
+                return Ok(result);
+            }
+        },
+    )?;
 
     //添加工具节点
     let tool_node: Arc<dyn Runnable> = Arc::new(ToolNode::new(prepared.tools.clone()));
@@ -487,41 +497,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = print_stream(&mut stream, false).await;
 
         println!(); // 换行
+
         /*let start = Instant::now();
-        let mut first_token = true;
+                let mut first_token = true;
 
-        print!("Assistant: ");
-        io::stdout().flush()?;
+                print!("Assistant: ");
+                io::stdout().flush()?;
 
-        let mut stream = agentgraph.astream(
-            &input,
-            &config,
-            vec![StreamMode::Custom, StreamMode::Updates],
-        );
+                let mut stream = agentgraph.astream(
+                    &input,
+                    &config,
+                    vec![StreamMode::Custom, StreamMode::Updates],
+                );
 
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamPart { mode: StreamMode::Custom, data, .. } => {
-                    if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
-                        if first_token {
-                        let ttft = start.elapsed();
-                        eprintln!("\n[TTFT] {:.2}ms", ttft.as_secs_f64() * 1000.0);
-                        first_token = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        StreamPart { mode: StreamMode::Custom, data, .. } => {
+                            if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
+                                if first_token {
+                                let ttft = start.elapsed();
+                                eprintln!("\n[TTFT] {:.2}ms", ttft.as_secs_f64() * 1000.0);
+                                first_token = false;
+                            }
+                            print!("{}", content);
+                            io::stdout().flush()?;
+                        }
                     }
-                    print!("{}", content);
-                    io::stdout().flush()?;
+                StreamPart { mode: StreamMode::Updates, data, .. } => {
+                    // 可以选择忽略，或打印更新内容（调试用）
+                    //eprintln!("[Update] {:?}", data);
                 }
+                _ => {} // 防御性处理
             }
-        StreamPart { mode: StreamMode::Updates, data, .. } => {
-            // 可以选择忽略，或打印更新内容（调试用）
-            //eprintln!("[Update] {:?}", data);
         }
-        _ => {} // 防御性处理
-    }
-}
 
-println!();*/
-
+        println!();*/
     }
 
     return Ok(());
