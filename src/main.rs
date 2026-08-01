@@ -254,7 +254,7 @@ async fn correct_memory(
             let msg = data.message.unwrap_or_else(|| "未知错误".to_string());
             return Err(format!("操作失败：{}", msg));
         }
-    } else if response.status() == 404 {
+    } else if status == 404 {
         return Err(format!(
             "记忆ID {} 不存在，请确认ID是否正确",
             payload.memory_id
@@ -369,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(v) => v,
                     Err(_) => return Err(RunnableError::Other("MEMOS_BASE_URL not set".into())),
                 };
-                let user_id = env::var("USER_ID").unwrap_or_else(|_| "01".to_string());
+                let user_id = env::var("USER_ID").unwrap_or_else(|_| "default".to_string());
 
                 //构造请求
                 let client = reqwest::Client::new();
