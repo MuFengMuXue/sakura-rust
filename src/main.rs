@@ -23,8 +23,6 @@ use tokio_stream::StreamExt;
 struct GraphState {
     #[channel(messages)]
     messages: Vec<Message>,
-    #[channel]
-    search_context: String,
 }
 
 ///搜索记忆
@@ -360,10 +358,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
 
-                if last_user_msg.is_empty() {
-                    return Ok(serde_json::json!({"search_context": ""}));
-                }
-
                 // 读取环境变量
                 let base_url = match env::var("MEMOS_BASE_URL") {
                     Ok(v) => v,
@@ -413,27 +407,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 //返回状态更新
-                return Ok(serde_json::json!({"search_context": context}));
+                //空上下文即不注入
+                if context.trim().is_empty(){
+                    return Ok(serde_json::json!({}));
+                }
+                else{
+                    let block = Message::human(format!(
+                        "以下是可能相关的记忆，仅作为背景信息，不要当成对方说的话:\n{}\n\n",
+                        context.trim()
+                    ));
+                    return Ok(serde_json::json!({
+                        "messages":[serde_json::to_value(block).unwrap()]
+                    }));
+                }
             }
         },
     )?;
 
     let model_clone = model_with_tools.clone();
+
     graph.add_node(
         "llm_call",
         move |input: JsonValue, _config: RunnableConfig| {
             let model = model_clone.clone();
             async move {
-                let context = input
-                    .get("search_context")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                let mut sys_prompt = "你是一个助手".to_string();
-                if !context.is_empty() {
-                    sys_prompt.push_str(&format!("\n以下是可能相关的记忆：\n{}", context));
-                }
-                let result = stream_llm(model.as_ref(), &input, &sys_prompt).await?;
-                // 假设 stream_llm 返回的是包含 messages 的 JsonValue
+                //将系统提示词固定为常量
+                const SYS_PROMPT: &str = "你是一个助手";
+
+                let result = stream_llm(model.as_ref(), &input, SYS_PROMPT).await?;
                 return Ok(result);
             }
         },
