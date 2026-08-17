@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Instant;
 
 use dotenvy::dotenv;
 use langgraph::checkpoint::InMemorySaver;
@@ -15,7 +15,6 @@ use langgraph::prelude::*;
 use langgraph::providers::openai::{OpenAIModel, OpenAIModelConfig};
 use langgraph::tool;
 use serde_json::Value as JsonValue;
-use tokio_stream::StreamExt;
 
 //定义state
 #[langgraph_state]
@@ -342,12 +341,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let model_with_tools: Arc<dyn BaseChatModel> = model.bind_tools(prepared.tool_defs).into();
 
+    // 被动注入去重窗口:近 N 轮内已注入过的记忆不重复注入;0=全历史去重;缺失/非法=10
+    let dedup_window: usize = env::var("DEDUP_WINDOW_TURNS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10);
+
     let channels = GraphState::create_channels();
     let mut graph = StateGraph::new(channels);
 
     graph.add_node(
         "search_memories",
         move |input: JsonValue, _config: RunnableConfig| {
+            let window = dedup_window;
             async move {
                 // 提取用户消息
                 let last_user_msg = input
@@ -357,6 +363,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|msg| msg.get("content"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
+
+                if last_user_msg.is_empty() {
+                    return Ok(serde_json::json!({}));
+                }
 
                 // 读取环境变量
                 let base_url = match env::var("MEMOS_BASE_URL") {
@@ -388,38 +398,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => return Err(RunnableError::Other(Box::new(e))),
                 };
 
-                //检查状态码并解析
-                let context = if response.status().is_success() {
-                    // 使用 SearchResponse 结构体解析
+                //检查状态码并解析,按整条记忆收集(不做行拼接,保留多行内容)
+                let entries: Vec<String> = if response.status().is_success() {
                     let data: SearchResponse = match response.json().await {
                         Ok(d) => d,
                         Err(e) => return Err(RunnableError::Other(Box::new(e))),
                     };
-                    // 只提取 content，换行拼接
-                    data.memories
-                        .into_iter()
-                        .map(|m| m.content)
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    data.memories.into_iter().map(|m| m.content).collect()
                 } else {
                     eprintln!("搜索失败，状态码: {}", response.status());
-                    String::new()
+                    Vec::new()
                 };
 
-                //返回状态更新
-                //空上下文即不注入
-                if context.trim().is_empty(){
+                // ── 近 N 轮窗口去重 ──
+                let msgs = input.get("messages").and_then(|m| m.as_array());
+
+                // 判据:上下文块(带固定标记)vs 真·用户回合
+                let is_block = |m: &JsonValue| {
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |c| c.starts_with("<search-context>"))
+                };
+                let is_real_human = |m: &JsonValue| {
+                    m.get("type").and_then(|t| t.as_str()) == Some("human") && !is_block(m)
+                };
+
+                let n_humans = msgs
+                    .map(|arr| arr.iter().filter(|m| is_real_human(m)).count())
+                    .unwrap_or(0);
+
+                // 窗口起点:第 (n_humans - window) 个真回合之后;window==0 或回合不足则全历史
+                let mut cutoff = 0usize;
+                if window > 0 && n_humans > window {
+                    if let Some(arr) = msgs {
+                        let mut seen_turns = 0usize;
+                        for (i, m) in arr.iter().enumerate() {
+                            if is_real_human(m) {
+                                seen_turns += 1;
+                            }
+                            if seen_turns == n_humans - window {
+                                cutoff = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 收集窗口内已注入过的条目文本:块内 "- " 开头开新条目,其余行并入上一条
+                let mut seen: HashSet<String> = HashSet::new();
+                if let Some(arr) = msgs {
+                    for m in arr.iter().skip(cutoff) {
+                        let content = match m.get("content").and_then(|c| c.as_str()) {
+                            Some(c) if c.starts_with("<search-context>") => c,
+                            _ => continue,
+                        };
+                        let mut current: Vec<&str> = Vec::new();
+                        for line in content.lines() {
+                            if line == "</search-context>" {
+                                if !current.is_empty() {
+                                    seen.insert(current.join("\n").trim().to_string());
+                                }
+                                current.clear();
+                                break;
+                            }
+                            if let Some(rest) = line.strip_prefix("- ") {
+                                if !current.is_empty() {
+                                    seen.insert(current.join("\n").trim().to_string());
+                                }
+                                current = vec![rest];
+                            } else if !current.is_empty() {
+                                current.push(line);
+                            }
+                        }
+                        if !current.is_empty() {
+                            seen.insert(current.join("\n").trim().to_string());
+                        }
+                    }
+                }
+
+                // 只注入窗口内没见过的条目(顺带去本轮重复)
+                let mut fresh: Vec<String> = Vec::new();
+                let mut injected: HashSet<String> = HashSet::new();
+                for e in entries.iter() {
+                    let e = e.trim().to_string();
+                    if e.is_empty() || seen.contains(&e) || injected.contains(&e) {
+                        continue;
+                    }
+                    injected.insert(e.clone());
+                    fresh.push(e);
+                }
+
+                // 零新增 → 零注入,缓存前缀不动
+                if fresh.is_empty() {
                     return Ok(serde_json::json!({}));
                 }
-                else{
-                    let block = Message::human(format!(
-                        "以下是可能相关的记忆，仅作为背景信息，不要当成对方说的话:\n{}\n\n",
-                        context.trim()
-                    ));
-                    return Ok(serde_json::json!({
-                        "messages":[serde_json::to_value(block).unwrap()]
-                    }));
-                }
+
+                // 组装固定标记块,作为 user 消息进 messages channel(随历史固化)
+                let block = Message::human(format!(
+                    "<search-context>\n以下是可能相关的记忆，仅作为背景信息，不要当成对方说的话:\n{}\n</search-context>",
+                    fresh
+                        .iter()
+                        .map(|e| format!("- {}", e))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+                return Ok(serde_json::json!({
+                    "messages":[serde_json::to_value(block).unwrap()]
+                }));
             }
         },
     )?;
