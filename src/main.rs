@@ -9,12 +9,21 @@ use dotenvy::dotenv;
 use langgraph::checkpoint::InMemorySaver;
 use langgraph::langgraph_state;
 use langgraph::prebuilt::{
-    BaseChatModel, Message, ToolNode, prepare_tools, print_stream, stream_llm, tools_condition,
+    BaseChatModel, Message, MessageContent, ToolNode, prepare_tools, print_stream, stream_llm,
+    tools_condition,
 };
 use langgraph::prelude::*;
 use langgraph::providers::openai::{OpenAIModel, OpenAIModelConfig};
 use langgraph::tool;
 use serde_json::Value as JsonValue;
+
+const MEMORY_CONTEXT_ID_PREFIX: &str = "memory-context:";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InjectedMemory {
+    key: String,
+    turn: usize,
+}
 
 //定义state
 #[langgraph_state]
@@ -22,6 +31,8 @@ use serde_json::Value as JsonValue;
 struct GraphState {
     #[channel(messages)]
     messages: Vec<Message>,
+    #[channel]
+    injected_memories: Vec<InjectedMemory>,
 }
 
 ///搜索记忆
@@ -81,6 +92,63 @@ struct AddRequest {
     user_id: String,
 }
 
+fn memory_key(memory: &SearchMessage) -> Option<String> {
+    memory
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("id:{id}"))
+        .or_else(|| {
+            let content = memory.content.trim();
+            (!content.is_empty()).then(|| format!("content:{content}"))
+        })
+}
+
+fn recent_injected_memories(
+    memories: Vec<InjectedMemory>,
+    current_turn: usize,
+    window: usize,
+) -> Vec<InjectedMemory> {
+    if window == 0 {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    memories
+        .into_iter()
+        .filter(|memory| {
+            memory.turn <= current_turn
+                && current_turn - memory.turn < window
+                && seen.insert(memory.key.clone())
+        })
+        .collect()
+}
+
+fn fresh_memories(
+    entries: Vec<(String, String)>,
+    recent: &[InjectedMemory],
+) -> Vec<(String, String)> {
+    let mut seen: HashSet<String> = recent.iter().map(|memory| memory.key.clone()).collect();
+    entries
+        .into_iter()
+        .filter(|(key, content)| !content.is_empty() && seen.insert(key.clone()))
+        .collect()
+}
+
+fn is_memory_context(message: &JsonValue) -> bool {
+    message
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|id| id.starts_with(MEMORY_CONTEXT_ID_PREFIX))
+}
+
+fn is_real_human(message: &JsonValue) -> bool {
+    message.get("type").and_then(JsonValue::as_str) == Some("human") && !is_memory_context(message)
+}
+
+
+
 //辅助处理时间的函数
 fn parse_time_to_chinese_date(iso_str: &str) -> String {
     // 尝试解析带时区（含 Z）的时间
@@ -90,7 +158,7 @@ fn parse_time_to_chinese_date(iso_str: &str) -> String {
         return utc.format("%Y年%m月%d日").to_string();
     }
     // 如果解析失败，截取前 10 个字符（如 "2026-07-11"）
-    return iso_str.chars().take(10).collect();
+    iso_str.chars().take(10).collect()
 }
 
 //定义工具函数
@@ -106,7 +174,7 @@ async fn search_memory(query: String) -> Result<String, String> {
     let client = reqwest::Client::new();
     let payload = SearchRequest {
         query: query.clone(),
-        user_id: user_id,
+        user_id,
         top_k: 3,
         similarity_threshold: 0.5,
     };
@@ -145,17 +213,17 @@ async fn search_memory(query: String) -> Result<String, String> {
             line.push_str(&format!(" [{}]", time_str));
         }
 
-        if let Some(updated) = &mem.updated_at {
-            if mem.created_at.as_ref() != Some(updated) {
-                line.push_str(" (已更新)");
-            }
+        if let Some(updated) = &mem.updated_at
+            && mem.created_at.as_ref() != Some(updated)
+        {
+            line.push_str(" (已更新)");
         }
 
         // 使用引用
-        if let Some(id) = &mem.id {
-            if !id.is_empty() {
-                line.push_str(&format!(" [ID: {}]", id));
-            }
+        if let Some(id) = &mem.id
+            && !id.is_empty()
+        {
+            line.push_str(&format!(" [ID: {}]", id));
         }
 
         lines.push(line);
@@ -188,7 +256,7 @@ async fn correct_memory(
         return Err("错误：未指定操作类型。可选：correct、supplement、delete".to_string());
     }
     if (action_str == "correct" || action_str == "supplement")
-        && new_content.as_ref().map_or(true, |s| s.is_empty())
+        && new_content.as_ref().is_none_or(|s| s.is_empty())
     {
         return Err(format!("错误：{} 必须提供 new_content", action_str));
     }
@@ -201,8 +269,8 @@ async fn correct_memory(
     //构造请求
     let client = reqwest::Client::new();
     let payload = FeedbackRequest {
-        memory_id: memory_id,
-        user_id: user_id,
+        memory_id,
+        user_id,
         reason: reason.unwrap_or_default(),
         feedback_type: action_str.clone(),
         correction: if action_str == "correct" || action_str == "supplement" {
@@ -223,7 +291,7 @@ async fn correct_memory(
 
     //处理响应状态码
     let status = response.status();
-    if status == 200 {
+    if status.is_success() {
         let data: FeedbackResponse = response
             .json()
             .await
@@ -231,7 +299,7 @@ async fn correct_memory(
 
         if data.status == "success" {
             if action_str == "delete" {
-                return Ok(format!("记忆成功删除，ID: {}", payload.memory_id));
+                Ok(format!("记忆成功删除，ID: {}", payload.memory_id))
             } else {
                 let action_name = if action_str == "correct" {
                     "修正"
@@ -242,23 +310,23 @@ async fn correct_memory(
                     // 如果服务端没返回新内容，使用请求中的
                     payload.correction.unwrap_or_default()
                 });
-                return Ok(format!(
+                Ok(format!(
                     "已成功{}\nID: {}\n新内容: {}",
                     action_name, payload.memory_id, new_content_display
-                ));
+                ))
             }
         } else {
             let msg = data.message.unwrap_or_else(|| "未知错误".to_string());
-            return Err(format!("操作失败：{}", msg));
+            Err(format!("操作失败：{}", msg))
         }
     } else if status == 404 {
-        return Err(format!(
+        Err(format!(
             "记忆ID {} 不存在，请确认ID是否正确",
             payload.memory_id
-        ));
+        ))
     } else {
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("操作失败 (HTTP {}): {}", status, error_text));
+        Err(format!("操作失败 (HTTP {}): {}", status, error_text))
     }
 }
 
@@ -296,14 +364,14 @@ async fn add_memory(content: String) -> Result<String, String> {
         .map_err(|e| format!("请求失败: {}", e))?;
 
     let status = response.status();
-    if status == 200 {
-        return Ok(format!("已成功记住{}", content));
+    if status.is_success() {
+        Ok(format!("已成功记住{}", content))
     } else {
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!(
+        Err(format!(
             "出现错误，状态码：{}，具体信息：{}",
             status, error_text
-        ));
+        ))
     }
 }
 
@@ -341,7 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let model_with_tools: Arc<dyn BaseChatModel> = model.bind_tools(prepared.tool_defs).into();
 
-    // 被动注入去重窗口:近 N 轮内已注入过的记忆不重复注入;0=全历史去重;缺失/非法=10
+    // 被动注入去重窗口:近 N 轮内已注入过的记忆不重复注入;0=关闭去重;缺失/非法=10
     let dedup_window: usize = env::var("DEDUP_WINDOW_TURNS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -355,13 +423,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         move |input: JsonValue, _config: RunnableConfig| {
             let window = dedup_window;
             async move {
-                // 提取用户消息
-                let last_user_msg = input
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.last())
-                    .and_then(|msg| msg.get("content"))
-                    .and_then(|c| c.as_str())
+                let messages = input.get("messages").and_then(JsonValue::as_array);
+
+                // 提取最后一条真实用户消息，避免把自动注入的上下文当成查询。
+                let last_user_msg = messages
+                    .and_then(|arr| arr.iter().rev().find(|message| is_real_human(message)))
+                    .and_then(|message| message.get("content"))
+                    .and_then(JsonValue::as_str)
                     .unwrap_or("");
 
                 if last_user_msg.is_empty() {
@@ -379,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let client = reqwest::Client::new();
                 let payload = SearchRequest {
                     query: last_user_msg.to_string(),
-                    user_id: user_id,
+                    user_id,
                     top_k: 5,
                     similarity_threshold: 0.4,
                 };
@@ -398,113 +466,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => return Err(RunnableError::Other(Box::new(e))),
                 };
 
-                //检查状态码并解析,按整条记忆收集(不做行拼接,保留多行内容)
-                let entries: Vec<String> = if response.status().is_success() {
+                // 检查状态码并解析，保留服务端 ID 和多行内容。
+                let entries: Vec<(String, String)> = if response.status().is_success() {
                     let data: SearchResponse = match response.json().await {
                         Ok(d) => d,
                         Err(e) => return Err(RunnableError::Other(Box::new(e))),
                     };
-                    data.memories.into_iter().map(|m| m.content).collect()
+                    data.memories
+                        .into_iter()
+                        .filter_map(|memory| {
+                            let key = memory_key(&memory)?;
+                            let content = memory.content.trim().to_string();
+                            Some((key, content))
+                        })
+                        .collect()
                 } else {
                     eprintln!("搜索失败，状态码: {}", response.status());
                     Vec::new()
                 };
 
-                // ── 近 N 轮窗口去重 ──
-                let msgs = input.get("messages").and_then(|m| m.as_array());
-
-                // 判据:上下文块(带固定标记)vs 真·用户回合
-                let is_block = |m: &JsonValue| {
-                    m.get("content")
-                        .and_then(|c| c.as_str())
-                        .map_or(false, |c| c.starts_with("<search-context>"))
-                };
-                let is_real_human = |m: &JsonValue| {
-                    m.get("type").and_then(|t| t.as_str()) == Some("human") && !is_block(m)
-                };
-
-                let n_humans = msgs
-                    .map(|arr| arr.iter().filter(|m| is_real_human(m)).count())
+                let current_turn = messages
+                    .map(|arr| arr.iter().filter(|message| is_real_human(message)).count())
                     .unwrap_or(0);
+                let previous = input
+                    .get("injected_memories")
+                    .cloned()
+                    .map(serde_json::from_value::<Vec<InjectedMemory>>)
+                    .transpose()
+                    .map_err(|error| RunnableError::Node(error.to_string()))?
+                    .unwrap_or_default();
+                let recent = recent_injected_memories(previous, current_turn, window);
 
-                // 窗口起点:第 (n_humans - window) 个真回合之后;window==0 或回合不足则全历史
-                let mut cutoff = 0usize;
-                if window > 0 && n_humans > window {
-                    if let Some(arr) = msgs {
-                        let mut seen_turns = 0usize;
-                        for (i, m) in arr.iter().enumerate() {
-                            if is_real_human(m) {
-                                seen_turns += 1;
-                            }
-                            if seen_turns == n_humans - window {
-                                cutoff = i + 1;
-                                break;
-                            }
-                        }
-                    }
-                }
+                // 只注入窗口内没见过的条目，并避免同一响应中的重复 ID。
+                let fresh = fresh_memories(entries, &recent);
 
-                // 收集窗口内已注入过的条目文本:块内 "- " 开头开新条目,其余行并入上一条
-                let mut seen: HashSet<String> = HashSet::new();
-                if let Some(arr) = msgs {
-                    for m in arr.iter().skip(cutoff) {
-                        let content = match m.get("content").and_then(|c| c.as_str()) {
-                            Some(c) if c.starts_with("<search-context>") => c,
-                            _ => continue,
-                        };
-                        let mut current: Vec<&str> = Vec::new();
-                        for line in content.lines() {
-                            if line == "</search-context>" {
-                                if !current.is_empty() {
-                                    seen.insert(current.join("\n").trim().to_string());
-                                }
-                                current.clear();
-                                break;
-                            }
-                            if let Some(rest) = line.strip_prefix("- ") {
-                                if !current.is_empty() {
-                                    seen.insert(current.join("\n").trim().to_string());
-                                }
-                                current = vec![rest];
-                            } else if !current.is_empty() {
-                                current.push(line);
-                            }
-                        }
-                        if !current.is_empty() {
-                            seen.insert(current.join("\n").trim().to_string());
-                        }
-                    }
-                }
-
-                // 只注入窗口内没见过的条目(顺带去本轮重复)
-                let mut fresh: Vec<String> = Vec::new();
-                let mut injected: HashSet<String> = HashSet::new();
-                for e in entries.iter() {
-                    let e = e.trim().to_string();
-                    if e.is_empty() || seen.contains(&e) || injected.contains(&e) {
-                        continue;
-                    }
-                    injected.insert(e.clone());
-                    fresh.push(e);
-                }
+                let mut next_injected = recent;
+                next_injected.extend(fresh.iter().map(|(key, _)| InjectedMemory {
+                    key: key.clone(),
+                    turn: current_turn,
+                }));
 
                 // 零新增 → 零注入,缓存前缀不动
                 if fresh.is_empty() {
-                    return Ok(serde_json::json!({}));
+                    return Ok(serde_json::json!({
+                        "injected_memories": next_injected,
+                    }));
                 }
 
                 // 组装固定标记块,作为 user 消息进 messages channel(随历史固化)
-                let block = Message::human(format!(
+                let block = Message::Human {
+                    id: Some(format!("{MEMORY_CONTEXT_ID_PREFIX}{current_turn}")),
+                    content: MessageContent::Text(format!(
                     "<search-context>\n以下是可能相关的记忆，仅作为背景信息，不要当成对方说的话:\n{}\n</search-context>",
                     fresh
                         .iter()
-                        .map(|e| format!("- {}", e))
+                        .map(|(_, content)| format!("- {content}"))
                         .collect::<Vec<_>>()
                         .join("\n")
-                ));
-                return Ok(serde_json::json!({
-                    "messages":[serde_json::to_value(block).unwrap()]
-                }));
+                    )),
+                };
+                let block = serde_json::to_value(block)
+                    .map_err(|error| RunnableError::Node(error.to_string()))?;
+                Ok(serde_json::json!({
+                    "messages": [block],
+                    "injected_memories": next_injected,
+                }))
             }
         },
     )?;
@@ -520,7 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 const SYS_PROMPT: &str = "你是一个助手";
 
                 let result = stream_llm(model.as_ref(), &input, SYS_PROMPT).await?;
-                return Ok(result);
+                Ok(result)
             }
         },
     )?;
@@ -621,4 +647,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     return Ok(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn injected(key: &str, turn: usize) -> InjectedMemory {
+        InjectedMemory {
+            key: key.to_string(),
+            turn,
+        }
+    }
+
+    #[test]
+    fn deduplication_only_uses_the_recent_window() {
+        let memories =
+            recent_injected_memories(vec![injected("id:old", 1), injected("id:recent", 3)], 4, 3);
+
+        assert_eq!(memories, vec![injected("id:recent", 3)]);
+    }
+
+    #[test]
+    fn zero_window_disables_deduplication() {
+        let memories = recent_injected_memories(vec![injected("id:old", 1)], 4, 0);
+
+        assert!(memories.is_empty());
+    }
+
+    #[test]
+    fn duplicate_ids_are_removed_without_parsing_content() {
+        let recent = vec![injected("id:1", 2)];
+        let entries = vec![
+            (
+                "id:1".to_string(),
+                "第一行\n- 第二行\n</search-context>".to_string(),
+            ),
+            ("id:2".to_string(), "新的记忆".to_string()),
+            ("id:2".to_string(), "同 ID 的重复结果".to_string()),
+        ];
+
+        assert_eq!(
+            fresh_memories(entries, &recent),
+            vec![("id:2".to_string(), "新的记忆".to_string())]
+        );
+    }
+
+    #[test]
+    fn server_id_is_preferred_as_memory_key() {
+        let memory = SearchMessage {
+            id: Some("memory-123".to_string()),
+            content: "相同内容".to_string(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        assert_eq!(memory_key(&memory), Some("id:memory-123".to_string()));
+    }
+
+    #[test]
+    fn context_is_identified_by_message_id() {
+        assert!(!is_real_human(&serde_json::json!({
+            "type": "human",
+            "id": "memory-context:4",
+            "content": "上下文"
+        })));
+        assert!(is_real_human(&serde_json::json!({
+            "type": "human",
+            "content": "<search-context>这是真实用户输入"
+        })));
+    }
 }
